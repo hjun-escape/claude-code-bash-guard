@@ -30,15 +30,19 @@ A bare mention of the account id (in an ARN, a CDK account map, or docs) is data
 
 Heredocs, `$( … )`, backticks and `$(( … ))` (each substitution is checked as its own command), `<( … )` process substitution, line continuations, wrappers (`env`, `sudo`, `timeout`, `xargs`, `npx`, `uvx`…), inline and exported variables, `cd` / `git -C`, and shell functions, whose bodies are checked where they're **called**, with the environment of that moment.
 
+Nested shells (`bash -c`, `sh -c`, a heredoc'd or script-file shell) and `eval` get their command lines checked with the same rules and the environment they inherit. Comments start only where bash says they do: `# git push` after a space is a comment, but the `#` in `x=a#` is not.
+
 ## Tested like production code
 
 ```bash
-python3 test_bash_guard.py      # 121/121 passed
-python3 mutate_bash_guard.py    # 26 mutants, all KILLED
+python3 test_bash_guard.py      # 142/142 passed
+python3 mutate_bash_guard.py    # 38 mutants, all KILLED
 ```
 
-- **121 table cases** (allow / ask / deny). Many are replays of real commands that the guard once got wrong in either direction.
-- **26 mutants.** Each one removes or bends a single rule, for example "AWS non-read ops allowed", "explicit dev profile doesn't win", "function calls not expanded", "any mention of the account id = prod". The table tests must fail for every mutant. A mutant that survives means that rule has no test protecting it.
+- **141 table cases** (allow / ask / deny), plus an end-to-end run of the `bash-guard.sh` fast path. Many are replays of real commands that the guard once got wrong in either direction.
+- **38 mutants.** Each one removes or bends a single rule, for example "AWS non-read ops allowed", "explicit dev profile doesn't win", "function calls not expanded", "nested shells not analyzed", "any mention of the account id = prod". The table tests must fail for every mutant. A mutant that survives means that rule has no test protecting it.
+
+A security review found five ways around an earlier version: commands nested in `bash -c` or `eval`, a mid-word `#` that the parser read as a comment, `AWS_DEFAULT_PROFILE`, an uppercase `--stage PROD`, and unparseable commands that were allowed. Each fix started as a failing test and has its own mutant.
 
 The tests build a throwaway workspace (two git repos, `acme/api` and `acme/web_app`, plus fixture scripts) and run with `BASH_GUARD_OFFLINE=1`, so they never call GitHub.
 

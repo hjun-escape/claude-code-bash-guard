@@ -21,6 +21,8 @@ or, with nothing selected, when the code it runs picks the prod profile itself. 
 bash…) whose code is visible (-c/-e, heredoc, a script written earlier in the command, the script file on disk),
 only code that touches AWS with a WRITE call is gated; prod-read code passes. Invisible code under prod
 credentials still asks. A bare mention of the account id (an ARN, a CDK account map, docs) is data, not use.
+Nested shells (`bash -c`, `sh -c`, a heredoc'd or script-file shell) and `eval` are re-checked as command
+lines with the same rules, and `#` starts a comment only where bash says it does.
 Lessons that shaped it: matching on any mention of the account id prompted on `mkdir` and CDK edits; scanning
 on-disk scripts that merely SUPPORT prod flagged `ruff`, `cmp` and `--stage dev` runs; continuation lines and
 `<(…)` were mis-parsed. A hook "ask" prompts even in auto mode and even when an allow rule like Bash(gh *)
@@ -36,9 +38,12 @@ import sys
 PROD_ACCOUNT = os.environ.get("BASH_GUARD_PROD_ACCOUNT", "111111111111")
 # Credential SELECTION of the prod account (profile_name=…, AWS_PROFILE=…, --profile …, fromIni({profile: …})).
 PROD_CREDENTIAL = re.compile(
-    r"(?:profile_name|profile|AWS_PROFILE|--profile|--aws-profile)[\"'\]\s]*[:=,]?\s*[\"']?[^\"'\s,)]*" + PROD_ACCOUNT)
+    r"(?:profile_name|profile|AWS_PROFILE|AWS_DEFAULT_PROFILE|--profile|--aws-profile)[\"'\]\s]*[:=,]?\s*[\"']?[^\"'\s,)]*" + PROD_ACCOUNT)
 HEREDOC_TOKEN = re.compile(r"__HEREDOC_(\d+)__")
 INTERPRETER = re.compile(r"^(python[\d.]*|node|bash|sh|zsh|ruby|perl|deno|bun|tsx|ts-node)$")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}  # their -c string / heredoc / script is re-checked as a command line
+# gated commands, for a command line that shlex cannot parse (it fails closed when one of these appears)
+GATED_HINT = re.compile(r"\b(?:git\s+push|git\s+commit\b.*--no-verify|gh\s+(?:release|pr\s+merge|workflow\s+run|run\s+rerun|api)|(?:sls|serverless|cdk)\s+(?:deploy|remove|rollback|invoke|destroy))\b")
 # Code that CHANGES state (boto3 snake_case verbs, SDK v3 *Command classes, DocumentClient v2,
 # CLI write ops, HTTP writes). add_/import_/set_ are left out on purpose: argparse add_argument, importlib
 # import_module etc. are everywhere and never write to AWS.
@@ -164,15 +169,48 @@ def extract_substitutions(s):
     return "".join(out), subs
 
 
+def strip_comments(s):
+    """Drop shell comments the way bash does: `#` starts one only at the start of a word (after whitespace, a
+    newline or an operator) and outside quotes. shlex's own comment handling also cuts `a#b` mid-word, which
+    would hide everything after it from the guard."""
+    out, i, n, quote = [], 0, len(s), None
+    while i < n:
+        c = s[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(s[i + 1])
+                i += 2
+                continue
+            quote = None if c == quote else quote
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "#" and (i == 0 or s[i - 1] in " \t\n;&|()<>"):
+            j = s.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def is_op(tok):
     return tok != "" and all(c in ";&|()<>\n" for c in tok)
 
 
 def segments(cmd):
     cmd = cmd.replace("\\\n", " ")  # backslash-newline is a line continuation, not a command separator
+    cmd = strip_comments(cmd)
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
+    lex.commenters = ""  # bash comments start only at a word boundary: strip_comments handles them
     segs, cur = [], []
     for tok in lex:
         # `name() {` / `function name() {` defines a shell function: mark it, so its body is checked where it's CALLED
@@ -350,7 +388,7 @@ def check_sls(args, env, seg_prod, ask):
     if verb not in SLS_MUTATING or (verb == "invoke" and len(pos) > 1 and pos[1] == "local"):
         return
     stage = values.get("--stage") or values.get("-s") or env.get("STAGE") or ""
-    prod = stage in PROD_STAGES or env.get("ENV", "").endswith("-prod") or seg_prod
+    prod = stage.lower() in PROD_STAGES or env.get("ENV", "").endswith("-prod") or seg_prod
     if prod:
         ask.append(f"`sls {verb}` targeting PROD (stage {stage or env.get('ENV') or 'prod account'})")
 
@@ -500,7 +538,7 @@ def read_small(path):
 def prod_selection(scoped, args):
     """'prod' / 'nonprod' / None: the credentials this segment's own command line or environment selects —
     --profile / --aws-profile, then AWS_PROFILE, then --stage. An explicit choice beats code-level hints."""
-    prof = scoped.get("AWS_PROFILE")
+    prof = scoped.get("AWS_PROFILE") or scoped.get("AWS_DEFAULT_PROFILE")
     for i, a in enumerate(args):
         if a in ("--profile", "--aws-profile") and i + 1 < len(args):
             prof = args[i + 1]
@@ -543,20 +581,21 @@ def writes_stacks_map(cmd):
     return bool(direct or via_var)
 
 
-def analyze(cmd, cwd):
+def analyze(cmd, cwd, depth=0, env0=None):
     deny, ask = [], []
     if FORCE_TRUE.search(cmd) and writes_stacks_map(cmd):
         deny.append("BLOCK: a script that writes stacks-map.js with force: true — never add force: true "
                     "in stacks-map.js.")
     try:
         text, bodies = strip_heredocs(cmd)
+        text = strip_comments(text)
         text, subs = extract_substitutions(text)
         segs = segments(text) + [s for sub in subs for s in segments(sub)]
     except ValueError:
-        if PROD_CREDENTIAL.search(cmd) and WRITE_CODE.search(cmd):
-            ask.append("command selects PROD credentials, looks like a write, and could not be parsed")
+        if PROD_CREDENTIAL.search(cmd) or GATED_HINT.search(cmd):
+            ask.append("command could not be parsed, and it selects PROD credentials or runs a gated command")
         return deny, ask
-    cur_dir, env, written = cwd, {}, {}
+    cur_dir, env, written = cwd, dict(env0 or {}), {}
     queue, funcs, expansions, i = list(segs), {}, 0, -1
     while i + 1 < len(queue):
         i += 1
@@ -590,7 +629,7 @@ def analyze(cmd, cwd):
                     any(a.lower() in PROD_STAGES for a in args[1:]) or not re.search(r"\b(if|case)\b", content)):
                 env["AWS_PROFILE"] = PROD_ACCOUNT
         elif name == "aws":
-            check_aws(args, scoped.get("AWS_PROFILE"), ask)
+            check_aws(args, scoped.get("AWS_PROFILE") or scoped.get("AWS_DEFAULT_PROFILE"), ask)
         elif name in ("sls", "serverless"):
             check_sls(args, scoped, sel == "prod", ask)
         elif name == "gh":
@@ -603,6 +642,16 @@ def analyze(cmd, cwd):
             if expansions < 25:  # the body runs here; a self-calling function must not loop the guard
                 expansions += 1
                 queue[i + 1:i + 1] = [list(s) for s in funcs[name]]
+            continue
+        elif name == "eval" or (name in SHELLS and visible_code(args, bodies, cur_dir, written) is not None):
+            # a nested shell runs its own command line: check it like the outer one, with this segment's env
+            inner = " ".join(args) if name == "eval" else visible_code(args, bodies, cur_dir, written)
+            if depth < 3:
+                inner_deny, inner_ask = analyze(inner, cur_dir, depth + 1, scoped)
+                deny += inner_deny
+                ask += inner_ask
+            else:
+                ask.append(f"`{name}` nests shells too deeply to check")
             continue
         else:
             code_arg = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-c", "-e", "--eval")), None)

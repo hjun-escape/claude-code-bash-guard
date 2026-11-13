@@ -35,6 +35,18 @@ mutants = {
     "web main push gate removed": ('            if "main" in dests:', "            if False:"),
     "heredoc bodies parsed as code": ("def strip_heredocs(cmd):\n", "def strip_heredocs(cmd):\n    return cmd, []\n"),
     "every-merge gate removed": ("        else:\n            ask.append(f\"`gh pr merge` into {target", "        elif False:\n            ask.append(f\"`gh pr merge` into {target"),
+    "nested shells not analyzed": ("(name in SHELLS and visible_code", "(False and visible_code"),
+    "eval not analyzed": ('elif name == "eval" or (', "elif False or ("),
+    "nested env not inherited": ("analyze(inner, cur_dir, depth + 1, scoped)", "analyze(inner, cur_dir, depth + 1, None)"),
+    "nesting depth unbounded": ("            if depth < 3:\n", "            if True:\n"),
+    "real comments not stripped": ("def strip_comments(s):\n", "def strip_comments(s):\n    return s\n"),
+    "comment runs past the newline": ('            j = s.find("\\n", i)\n', "            j = -1\n"),
+    "mid-word # treated as comment": ('    lex.commenters = ""', '    lex.commenters = "#"'),
+    "AWS_DEFAULT_PROFILE ignored (aws)": ('check_aws(args, scoped.get("AWS_PROFILE") or scoped.get("AWS_DEFAULT_PROFILE"), ask)', 'check_aws(args, scoped.get("AWS_PROFILE"), ask)'),
+    "AWS_DEFAULT_PROFILE ignored (code)": ('    prof = scoped.get("AWS_PROFILE") or scoped.get("AWS_DEFAULT_PROFILE")\n', '    prof = scoped.get("AWS_PROFILE")\n'),
+    "sls stage case-sensitive": ("    prod = stage.lower() in PROD_STAGES", "    prod = stage in PROD_STAGES"),
+    "unparseable gated cmds allowed": ("PROD_CREDENTIAL.search(cmd) or GATED_HINT.search(cmd)", "PROD_CREDENTIAL.search(cmd) or False"),
+    "unparseable prod creds allowed": ("        if PROD_CREDENTIAL.search(cmd) or GATED_HINT", "        if False or GATED_HINT"),
 }
 scratch = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="bash-guard-mutants-"))
 survivors = 0

@@ -7,6 +7,7 @@ must ask. Fixtures live in temp dirs — a fake workspace with two git repos (ac
 scripts dir — never real repo files, whose contents depend on the branch checked out.
 """
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -177,6 +178,27 @@ CASES = [
     ("git commit -nm x", API, "ask"),
     (f"export AWS_PROFILE={P}; ID=$(aws dynamodb put-item --table-name T --item '{{}}')", MAIN, "ask"),
     (f"echo `aws dynamodb delete-item --table-name T --key x --profile {P}`", MAIN, "ask"),
+    # --- security review 2026-11-12: nested shells, eval, mid-word '#', AWS_DEFAULT_PROFILE, case, parse errors ---
+    ("echo hi # git push --force origin x", MAIN, "allow"),  # a real comment is not a command
+    (f"AWS_DEFAULT_PROFILE={P} aws s3 ls s3://b", MAIN, "allow"),
+    ('bash -c "git status && git push origin feat/x"', API, "allow"),
+    ('eval "echo hi"', MAIN, "allow"),
+    (f"export AWS_PROFILE={P}; bash -c 'aws dynamodb scan --table-name T'", MAIN, "allow"),
+    ('bash -c "git push --force origin feat/x"', API, "ask"),
+    ("sh -c 'gh release create v1 --target main'", API, "ask"),
+    ('eval "git push --force origin feat/x"', API, "ask"),
+    ("bash <<'EOF'\ngh release delete v1 -y\nEOF", API, "ask"),
+    (f"export AWS_PROFILE={P}; bash -c 'aws dynamodb delete-item --table-name T --key k'", MAIN, "ask"),
+    (f"x=a#; aws dynamodb delete-item --table-name T --key k --profile {P}", MAIN, "ask"),  # bash: '#' mid-word is not a comment
+    (f"AWS_DEFAULT_PROFILE={P} aws dynamodb delete-item --table-name T --key k", MAIN, "ask"),
+    (f"export AWS_DEFAULT_PROFILE={P}; node scripts/writes-by-default.js", TMP, "ask"),
+    ("sls deploy -s PROD", API, "ask"),
+    (f"aws s3 ls --profile {P} 'unbalanced", MAIN, "ask"),  # unparseable + prod credentials: fail closed
+    ("git push --force origin x 'unbalanced", API, "ask"),
+    ("echo ok # `git push --force origin x`", MAIN, "allow"),  # a substitution inside a comment never runs
+    ("echo hi # note\ngit push --force origin x", API, "ask"),  # a comment ends at the newline
+    ("eval eval eval eval git push origin feat/x", API, "ask"),  # nesting past 3 levels asks instead of recursing
+    ('bash -c "echo SECRET=1 > web_app/.env.local"', MAIN, "deny"),
     # --- deny: Bash writes that would bypass the Edit/Write guards ---
     ("echo SECRET=1 >> web_app/.env.secret", MAIN, "deny"),
     ("sed -i '' 's/a/b/' web_app/.env.local", MAIN, "deny"),
@@ -197,6 +219,17 @@ def load(path):
     return mod
 
 
+def check_wrapper():
+    """The bash fast path must hand case variants (`sls deploy -s PROD`) to the Python guard, not skip them."""
+    wrapper = os.path.join(HERE, "bash-guard.sh")
+    data = json.dumps({"tool_input": {"command": "sls deploy -s PROD"}, "cwd": API})
+    r = subprocess.run(["bash", wrapper], input=data, capture_output=True, text=True, timeout=30)
+    if '"ask"' in r.stdout:
+        return 0
+    print(f"FAIL wrapper fast path let `sls deploy -s PROD` through: {r.stdout or r.stderr!r}")
+    return 1
+
+
 def main():
     guard = load(sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "bash_guard.py"))
     failures = 0
@@ -206,7 +239,8 @@ def main():
         if got != want:
             failures += 1
             print(f"FAIL want={want} got={got}: {cmd!r} (cwd={os.path.relpath(cwd, MAIN)})\n     {deny or ask}")
-    print(f"{len(CASES) - failures}/{len(CASES)} passed")
+    failures += check_wrapper()
+    print(f"{len(CASES) + 1 - failures}/{len(CASES) + 1} passed")
     sys.exit(1 if failures else 0)
 
 

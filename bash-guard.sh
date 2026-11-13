@@ -3,6 +3,7 @@
 # Fast path: Python only runs when the raw input mentions a trigger word, so ordinary commands cost ~10 ms.
 in=$(cat)
 acct="${BASH_GUARD_PROD_ACCOUNT:-111111111111}"
+shopt -s nocasematch  # `--stage PROD` must reach the guard like `--stage prod`
 case "$in" in
   *"$acct"*|*prod*|*release*|*workflow*|*merge*|*push*|*rerun*|*commit*|*.env*|*stacks-map*|*key.properties*|*.pem*|*.p12*|*.keystore*|*.jks*|*certs/*|*lock*) ;;
   *) exit 0 ;;
