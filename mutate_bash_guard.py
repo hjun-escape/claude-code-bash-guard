@@ -69,12 +69,13 @@ mutants = {
     'directory part not checked': ('or "$" in seen:', 'or "$" in word.rsplit("/", 1)[-1]:'),
     'standard directory variables not allowed': ('    seen = re.sub(', '    seen = word or re.sub('),
     'dynamic bindings ignored': ('IFS\\+?=", text) or DYNAMIC_BINDING.search(text):', 'IFS\\+?=", text):'),
-    'piped assignment trusted': ('and not re.match(r"[^;\\n]*[|&]", text[found[0].end():])', 'and True'),
-    'assigned safe directory trusted': ('if not re.search(r"(?<![\\w$])" + v + r"\\+?=", text)', 'if True'),
+    'piped assignment trusted': ('    if re.search(r"[|&(]", text):', '    if False:'),
+    'assigned safe directory trusted': ('if not re.search(r"(?<![\\w${])" + v + r"(?![\\w}])", text)', 'if True'),
     'dynamic binding keeps safe directories': ('    if DYNAMIC_BINDING.search(text):\n        return frozenset()\n', ''),
     'child shells see unexported variables': ('sure if name == "eval" else sure & exported', 'sure'),
     'export not tracked': ('            exported.update(a.split("=", 1)[0] for a in args if not a.startswith("-"))\n', ''),
     'binding words matched inside paths': ('r"|getopts|let|unset)(?=\\s|$)', 'r"|getopts|let|unset)'),
+    'printf option clusters missed': ('r"\\bprintf\\b[^;&|\\n]*\\s-\\w*v|', 'r"\\bprintf\\s+-v(?=\\s)|'),
 }
 scratch = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="bash-guard-mutants-"))
 survivors = 0

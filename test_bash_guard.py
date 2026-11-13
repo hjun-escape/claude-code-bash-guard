@@ -249,6 +249,13 @@ CASES = [
     ("export G=/usr/bin/git; bash -c '$G status'", API, 'allow'),
     ('printf -v HOME "/usr/bin/git push --force origin x #"; $HOME/ls', API, 'ask'),  # a dynamic binding voids the safe directories too
     ('G=grep; for G in git; do :; done; $G push --force origin x', API, 'ask'),  # a for loop re-binds a plainly assigned variable
+    # --- security review round 7: re-bound safe directories, quoted separators, printf -vNAME ---
+    ('for HOME in "/usr/bin/git push --force origin x #"; do $HOME/ls; done', API, 'ask'),  # a for loop re-binds a safe directory variable
+    ('HOME[0]="/usr/bin/git push --force origin x #"; $HOME/ls', API, 'ask'),  # so does an array-element assignment
+    ('G="x;y" | true; $G git push --force origin x', API, 'ask'),  # a quoted ; must not hide the pipe
+    ('G=grep; printf -vG git; $G push --force origin x', API, 'ask'),  # printf -vNAME binds NAME too
+    ('G=git; while false; do G=grep; done; $G push --force origin x', API, 'ask'),  # assigned twice, the second in a loop that never runs
+    ('n=$(echo HOME); printf -v "$n" "/usr/bin/git push --force origin x #"; $HOME/ls', API, 'ask'),  # a dynamic binding to a hidden name voids the safe directories
     ('bash -c "echo SECRET=1 > web_app/.env.local"', MAIN, "deny"),
     # --- deny: Bash writes that would bypass the Edit/Write guards ---
     ("echo SECRET=1 >> web_app/.env.secret", MAIN, "deny"),

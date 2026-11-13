@@ -327,7 +327,7 @@ def split_redirects(seg):
 CONTROL_BEFORE = re.compile(r"&&|\|\||[|({]|\b(?:if|then|else|elif|do|while|until|case|for|select|function)\b")
 SAFE_DIRS = frozenset({"HOME", "PWD", "TMPDIR", "CLAUDE_PROJECT_DIR"})  # "$HOME/.local/bin/ruff": a known directory
 # binds a variable without spelling its name, or unsets one: nothing is certain on a line that does this
-DYNAMIC_BINDING = re.compile(r"\b(?:printf\s+-v|read|declare|typeset|local|readonly|mapfile|readarray"
+DYNAMIC_BINDING = re.compile(r"\bprintf\b[^;&|\n]*\s-\w*v|\b(?:read|declare|typeset|local|readonly|mapfile|readarray"
                              r"|getopts|let|unset)(?=\s|$)|\$\{\w+:?=|\$\{?\w+\}?\+?=")
 
 
@@ -335,26 +335,28 @@ def certain_vars(text, inherited=frozenset()):
     """Variables whose value is certain where a later command word reads it: assigned exactly once in this command
     line, with no &&, ||, pipe, group or control keyword before that assignment (it may not run), and never bound
     another way (read, printf -v, for, declare). Only bare and exported assignments reach env. Inherited names stay
-    certain unless this line binds them again. An assignment piped or backgrounded (`G=x | …`, `G=x &`) runs in a
-    subshell. Nothing is certain once IFS is assigned (word splitting changes) or on a line with a dynamic binding."""
+    certain unless this line binds them again. Nothing is certain on a line with a pipe, `&` or `(` (an assignment
+    there may run in a subshell, or not at all), once IFS is assigned, or with a dynamic binding."""
     if re.search(r"(?<![\w$])IFS\+?=", text) or DYNAMIC_BINDING.search(text):
+        return set()
+    if re.search(r"[|&(]", text):  # `G=x | …`, `G=x &`, `false && G=x`, `(G=x)`: quotes can't hide it from this
         return set()
     sure = set()
     for name in set(inherited) | set(re.findall(r"(?<![\w$])([A-Za-z_]\w*)\+?=", text)):
         if re.search(r"(?<![\w${])" + name + r"(?![\w=}])", text):  # read NAME, printf -v NAME, for NAME in …
             continue
         found = list(re.finditer(r"(?<![\w$])" + name + r"\+?=", text))
-        if not found or (len(found) == 1 and not CONTROL_BEFORE.search(text[:found[0].start()])
-                         and not re.match(r"[^;\n]*[|&]", text[found[0].end():])):
+        if not found or (len(found) == 1 and not CONTROL_BEFORE.search(text[:found[0].start()])):
             sure.add(name)
     return sure
 
 
 def safe_dirs(text, inherited=SAFE_DIRS):
-    """The SAFE_DIRS this command line leaves alone: one it assigns or binds can no longer be trusted as a prefix."""
+    """The SAFE_DIRS this command line only reads: one named any other way (`HOME=`, `HOME[0]=`, `for HOME in`) can no
+    longer be trusted as a prefix."""
     if DYNAMIC_BINDING.search(text):
         return frozenset()
-    return frozenset(v for v in inherited if not re.search(r"(?<![\w$])" + v + r"\+?=", text))
+    return frozenset(v for v in inherited if not re.search(r"(?<![\w${])" + v + r"(?![\w}])", text))
 
 
 def command_of(words, env=None, dirs=frozenset()):
