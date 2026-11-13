@@ -38,7 +38,6 @@ mutants = {
     "every-merge gate removed": ("        else:\n            ask.append(f\"`gh pr merge` into {target", "        elif False:\n            ask.append(f\"`gh pr merge` into {target"),
     "nested shells not analyzed": ("if name in SHELLS else None)", "if False else None)"),
     "eval not analyzed": ('nested = " ".join(args) if name == "eval" else (', 'nested = None if name == "eval" else ('),
-    "nested env not inherited": ("analyze(nested, cur_dir, depth + 1, scoped)", "analyze(nested, cur_dir, depth + 1, None)"),
     "nesting depth unbounded": ("                elif depth < 3:\n", "                elif True:\n"),
     "nested shell skips the outer checks": ("                    ask += inner_ask\n", "                    ask += inner_ask\n                    continue\n"),
     "eval text not treated as visible code": ("            code = nested if nested is not None else (", "            code = ("),
@@ -57,10 +56,18 @@ mutants = {
     "$'...' kept past NUL": (r'.split("\x00", 1)[0]', ""),
     "substitution bodies not normalized": ("segments(normalize(sub))", "segments(sub)"),
     "unseen command names allowed": ("        if name == UNSEEN:\n", "        if False:\n"),
-    "substitution output seen as a command": ('if "$" in name or "__SUBST__" in name:', 'if "$" in name:'),
     "command words not expanded": ("    word = expand_vars(words[i], env) if env else words[i]\n", "    word = words[i]\n"),
     "expanded command line not word-split": (r'    if word != words[i] and re.search(r"\s", word):', "    if False:"),
     "prefix-assigned variable read": (r'if set(re.findall(r"\$\{?([A-Za-z_]\w*)", nested)) & set(assigns):', "if False:"),
+    'substitution output seen as a command': ('"__SUBST__" in word or ', ''),
+    'nested env not inherited': ('analyze(nested, cur_dir, depth + 1, scoped, sure)', 'analyze(nested, cur_dir, depth + 1, None, sure)'),
+    'certainty not inherited by nested lines': ('depth + 1, scoped, sure)', 'depth + 1, scoped)'),
+    'IFS ignored': ('IFS\\+?=", text):\n        return set()\n', 'IFS\\+?=", text):\n        pass\n'),
+    'other bindings ignored': ('if re.search(r"(?<![\\w${])" + name + r"(?![\\w=}])", text):', 'if False:'),
+    'repeated assignments trusted': ('len(found) == 1', 'len(found) >= 1'),
+    'conditional assignment trusted': (' and not CONTROL_BEFORE.search(text[:found[0].start()])', ''),
+    'directory part not checked': ('"$" in SAFE_DIR_VAR.sub("", word)', '"$" in word.rsplit("/", 1)[-1]'),
+    'standard directory variables not allowed': ('SAFE_DIR_VAR.sub("", word)', 'word'),
 }
 scratch = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="bash-guard-mutants-"))
 survivors = 0

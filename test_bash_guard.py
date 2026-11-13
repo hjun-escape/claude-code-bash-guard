@@ -234,6 +234,13 @@ CASES = [
     ('CMD="git push --force origin x"; $CMD', API, 'ask'),  # an unquoted $CMD is word-split into a command line
     ('CMD="git status"; $CMD', API, 'allow'),
     ('"$HOME/.local/bin/ruff" check .', MAIN, 'allow'),  # a variable in the directory part leaves the name visible
+    # --- security review round 5: resolve a command-word variable only when its value is certain ---
+    ('G=git; false && G=grep; $G push --force origin x', API, 'ask'),  # assigned twice: the guard can't know which value runs
+    ('G=grep; printf -v G git; $G push --force origin x', API, 'ask'),  # bound another way (read, printf -v, for)
+    ('if false; then :; G=grep; fi; $G git push --force origin x', API, 'ask'),  # a conditional assignment may not run
+    ('IFS=,; CMD=git,push,--force,origin,x; $CMD', API, 'ask'),  # IFS changes how $CMD is split
+    ('$X/grep -c x file', MAIN, 'ask'),  # an unknown variable anywhere in the command word
+    ('export G=/usr/bin/git; $G status', API, 'allow'),
     ('bash -c "echo SECRET=1 > web_app/.env.local"', MAIN, "deny"),
     # --- deny: Bash writes that would bypass the Edit/Write guards ---
     ("echo SECRET=1 >> web_app/.env.secret", MAIN, "deny"),
