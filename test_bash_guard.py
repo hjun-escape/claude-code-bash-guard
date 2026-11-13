@@ -241,6 +241,14 @@ CASES = [
     ('IFS=,; CMD=git,push,--force,origin,x; $CMD', API, 'ask'),  # IFS changes how $CMD is split
     ('$X/grep -c x file', MAIN, 'ask'),  # an unknown variable anywhere in the command word
     ('export G=/usr/bin/git; $G status', API, 'allow'),
+    # --- security review round 6: subshell assignments, dynamic bindings, safe dirs, child-shell env ---
+    ('G=grep | true; $G git push --force origin x', API, 'ask'),  # a piped or backgrounded assignment runs in a subshell
+    ('n=$(echo G); G=grep; printf -v "$n" git; $G push --force origin x', API, 'ask'),  # a dynamic binding names no variable literally
+    ('HOME=x; HOME="/usr/bin/git push --force origin x #"; $HOME/ls', API, 'ask'),  # a reassigned $HOME is not a safe directory
+    ("G=grep; bash -c '$G git push --force origin x'", API, 'ask'),  # a child shell sees only exported variables
+    ("export G=/usr/bin/git; bash -c '$G status'", API, 'allow'),
+    ('printf -v HOME "/usr/bin/git push --force origin x #"; $HOME/ls', API, 'ask'),  # a dynamic binding voids the safe directories too
+    ('G=grep; for G in git; do :; done; $G push --force origin x', API, 'ask'),  # a for loop re-binds a plainly assigned variable
     ('bash -c "echo SECRET=1 > web_app/.env.local"', MAIN, "deny"),
     # --- deny: Bash writes that would bypass the Edit/Write guards ---
     ("echo SECRET=1 >> web_app/.env.secret", MAIN, "deny"),
