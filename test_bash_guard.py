@@ -115,7 +115,7 @@ CASES = [
     (f"export AWS_PROFILE={P}; S=$(( ($(date +%s) - 1200) * 1000 )); aws logs filter-log-events --log-group-name g --start-time $S", MAIN, "allow"),
     (f"export AWS_PROFILE={P}; aws cloudwatch get-metric-statistics --namespace AWS/Lambda --start-time $(date -u -v-1H +%FT%TZ) --end-time $(date -u +%FT%TZ) --period 300 --statistics Sum", MAIN, "allow"),
     (f"export AWS_PROFILE={P}; echo \"GET -> $(curl -s -o /dev/null -w '%{{http_code}}' https://x.execute-api.us-east-1.amazonaws.com/prod/)\"", MAIN, "allow"),
-    (f"export AWS_PROFILE={P}; G=/usr/bin/grep; $G -c x file", MAIN, "allow"),
+    (f"export AWS_PROFILE={P}; G=/usr/bin/grep; $G -c x file", MAIN, 'ask'),  # a command named by a variable asks, even one this line sets (resolution removed after review round 8)
     (f"export AWS_PROFILE={P}; [[ -f out.json ]] && aws s3 ls s3://b", MAIN, "allow"),  # `[[` is shell syntax, not a program
     # a continuation that splits service from operation (joined: a read), and inline code naming deploy files
     (f"export AWS_PROFILE={P}; aws dynamodb \\\n  query --table-name T --key-condition-expression 'pk = :p'", MAIN, "allow"),
@@ -213,7 +213,7 @@ CASES = [
     ('bash -o pipefail -c "git push --force origin feat/x"', API, "ask"),
     ('bash -lc "npm test"', API, "allow"),
     ("bash -c '\"$@\"' _ git push --force origin x", API, "ask"),  # the command is in arguments the guard can't see
-    ('CMD="git status"; eval "$CMD"', API, "allow"),  # variables set in the same command are expanded
+    ('CMD="git status"; eval "$CMD"', API, 'ask'),  # a command named by a variable asks, even one this line sets (resolution removed after review round 8)
     ('CMD="git push --force origin x"; eval "$CMD"', API, "ask"),
     (f"export AWS_PROFILE={P}; bash -c 'node scripts/writes-by-default.js'", TMP, "ask"),  # the nested shell inherits the profile
     (f"export AWS_PROFILE={P}; eval 'aws dynamodb scan --table-name T'", MAIN, "allow"),  # eval's text is its visible code, as with bash -c
@@ -232,21 +232,21 @@ CASES = [
     ('eval "if $X; then echo ok; fi"', API, 'ask'),
     ('$(echo git) push --force origin x', API, 'ask'),  # a command named by a substitution's output, at the top level too
     ('CMD="git push --force origin x"; $CMD', API, 'ask'),  # an unquoted $CMD is word-split into a command line
-    ('CMD="git status"; $CMD', API, 'allow'),
-    ('"$HOME/.local/bin/ruff" check .', MAIN, 'allow'),  # a variable in the directory part leaves the name visible
+    ('CMD="git status"; $CMD', API, 'ask'),  # a command named by a variable asks, even one this line sets (resolution removed after review round 8)
+    ('"$HOME/.local/bin/ruff" check .', MAIN, 'ask'),  # a command named by a variable asks, even one this line sets (resolution removed after review round 8)
     # --- security review round 5: resolve a command-word variable only when its value is certain ---
     ('G=git; false && G=grep; $G push --force origin x', API, 'ask'),  # assigned twice: the guard can't know which value runs
     ('G=grep; printf -v G git; $G push --force origin x', API, 'ask'),  # bound another way (read, printf -v, for)
     ('if false; then :; G=grep; fi; $G git push --force origin x', API, 'ask'),  # a conditional assignment may not run
     ('IFS=,; CMD=git,push,--force,origin,x; $CMD', API, 'ask'),  # IFS changes how $CMD is split
     ('$X/grep -c x file', MAIN, 'ask'),  # an unknown variable anywhere in the command word
-    ('export G=/usr/bin/git; $G status', API, 'allow'),
+    ('export G=/usr/bin/git; $G status', API, 'ask'),  # a command named by a variable asks, even one this line sets (resolution removed after review round 8)
     # --- security review round 6: subshell assignments, dynamic bindings, safe dirs, child-shell env ---
     ('G=grep | true; $G git push --force origin x', API, 'ask'),  # a piped or backgrounded assignment runs in a subshell
     ('n=$(echo G); G=grep; printf -v "$n" git; $G push --force origin x', API, 'ask'),  # a dynamic binding names no variable literally
     ('HOME=x; HOME="/usr/bin/git push --force origin x #"; $HOME/ls', API, 'ask'),  # a reassigned $HOME is not a safe directory
     ("G=grep; bash -c '$G git push --force origin x'", API, 'ask'),  # a child shell sees only exported variables
-    ("export G=/usr/bin/git; bash -c '$G status'", API, 'allow'),
+    ("export G=/usr/bin/git; bash -c '$G status'", API, 'ask'),  # a command named by a variable asks, even one this line sets (resolution removed after review round 8)
     ('printf -v HOME "/usr/bin/git push --force origin x #"; $HOME/ls', API, 'ask'),  # a dynamic binding voids the safe directories too
     ('G=grep; for G in git; do :; done; $G push --force origin x', API, 'ask'),  # a for loop re-binds a plainly assigned variable
     # --- security review round 7: re-bound safe directories, quoted separators, printf -vNAME ---

@@ -324,46 +324,10 @@ def split_redirects(seg):
     return words, targets
 
 
-CONTROL_BEFORE = re.compile(r"&&|\|\||[|({]|\b(?:if|then|else|elif|do|while|until|case|for|select|function)\b")
-SAFE_DIRS = frozenset({"HOME", "PWD", "TMPDIR", "CLAUDE_PROJECT_DIR"})  # "$HOME/.local/bin/ruff": a known directory
-# binds a variable without spelling its name, or unsets one: nothing is certain on a line that does this
-DYNAMIC_BINDING = re.compile(r"\bprintf\b[^;&|\n]*\s-\w*v|\b(?:read|declare|typeset|local|readonly|mapfile|readarray"
-                             r"|getopts|let|unset)(?=\s|$)|\$\{\w+:?=|\$\{?\w+\}?\+?=")
-
-
-def certain_vars(text, inherited=frozenset()):
-    """Variables whose value is certain where a later command word reads it: assigned exactly once in this command
-    line, with no &&, ||, pipe, group or control keyword before that assignment (it may not run), and never bound
-    another way (read, printf -v, for, declare). Only bare and exported assignments reach env. Inherited names stay
-    certain unless this line binds them again. Nothing is certain on a line with a pipe, `&` or `(` (an assignment
-    there may run in a subshell, or not at all), once IFS is assigned, or with a dynamic binding."""
-    if re.search(r"(?<![\w$])IFS\+?=", text) or DYNAMIC_BINDING.search(text):
-        return set()
-    if re.search(r"[|&(]", text):  # `G=x | …`, `G=x &`, `false && G=x`, `(G=x)`: quotes can't hide it from this
-        return set()
-    sure = set()
-    for name in set(inherited) | set(re.findall(r"(?<![\w$])([A-Za-z_]\w*)\+?=", text)):
-        if re.search(r"(?<![\w${])" + name + r"(?![\w=}])", text):  # read NAME, printf -v NAME, for NAME in …
-            continue
-        found = list(re.finditer(r"(?<![\w$])" + name + r"\+?=", text))
-        if not found or (len(found) == 1 and not CONTROL_BEFORE.search(text[:found[0].start()])):
-            sure.add(name)
-    return sure
-
-
-def safe_dirs(text, inherited=SAFE_DIRS):
-    """The SAFE_DIRS this command line only reads: one named any other way (`HOME=`, `HOME[0]=`, `for HOME in`) can no
-    longer be trusted as a prefix."""
-    if DYNAMIC_BINDING.search(text):
-        return frozenset()
-    return frozenset(v for v in inherited if not re.search(r"(?<![\w${])" + v + r"(?![\w}])", text))
-
-
-def command_of(words, env=None, dirs=frozenset()):
+def command_of(words):
     """Return (command name, args, inline assignments); name is None for keyword-only segments and UNSEEN for a
-    command word made of a variable or a substitution that this command line didn't set (`$CMD`, `$(echo git)`).
-    A variable whose value is certain (env holds only those: see certain_vars) is expanded, and an unquoted one
-    holding a whole command line is word-split into it, as bash does."""
+    command word built from a variable or a substitution (`$CMD`, `"$@"`, `$(echo git)`, `$X/grep`). The guard
+    doesn't work out what a variable holds: every bypass of the versions that tried was in that code."""
     assigns, i = {}, 0
     while i < len(words):
         t = words[i]
@@ -391,11 +355,8 @@ def command_of(words, env=None, dirs=frozenset()):
         break
     if i >= len(words):
         return None, [], assigns
-    word = expand_vars(words[i], env) if env else words[i]
-    if word != words[i] and re.search(r"\s", word):  # `CMD="git push --force"; $CMD`
-        return command_of(words[:i] + word.split() + words[i + 1:])
-    seen = re.sub(r"^\$\{?(?:" + "|".join(sorted(dirs)) + r")\}?(?=/)", "", word) if dirs else word
-    if "__SUBST__" in word or "$" in seen:  # `$X/grep`, `$(…)/git`: the whole word must be seen
+    word = words[i]
+    if "$" in word or "__SUBST__" in word:  # anywhere in the word: `$X/grep` can word-split into any command
         return UNSEEN, words[i + 1:], assigns
     name = word.rsplit("/", 1)[-1]
     if not re.fullmatch(r"[A-Za-z0-9_.][\w.+-]*", name) or not re.search(r"[A-Za-z]", name):
@@ -681,11 +642,6 @@ def code_index(args, shell):
                  if a in ("-c", "-e", "--eval") or re.fullmatch(r"-[A-Za-z]*[ce]", a)), None)
 
 
-def expand_vars(text, env):
-    """Substitute $VAR / ${VAR} that this command line set itself; references it can't resolve stay as written."""
-    return re.sub(r"\$(?:\{(\w+)\}|([A-Za-z_]\w*))", lambda m: env.get(m.group(1) or m.group(2), m.group(0)), text)
-
-
 def visible_code(args, bodies, cur_dir, written, shell=False):
     """The code an interpreter segment will run, when the command shows it: a -c/-e string, a heredoc body, a
     script written earlier in this command, or the script file on disk. None when it can't be seen."""
@@ -714,7 +670,7 @@ def writes_stacks_map(cmd):
     return bool(direct or via_var)
 
 
-def analyze(cmd, cwd, depth=0, env0=None, sure0=frozenset(), dirs0=SAFE_DIRS):
+def analyze(cmd, cwd, depth=0, env0=None):
     deny, ask = [], []
     if FORCE_TRUE.search(cmd) and writes_stacks_map(cmd):
         deny.append("BLOCK: a script that writes stacks-map.js with force: true — never add force: true "
@@ -728,8 +684,6 @@ def analyze(cmd, cwd, depth=0, env0=None, sure0=frozenset(), dirs0=SAFE_DIRS):
         ask.append("command could not be parsed, so the guard can't check it")
         return deny, ask
     cur_dir, env, written = cwd, dict(env0 or {}), {}
-    sure = certain_vars(text, sure0)  # the only variables a command word may be resolved from
-    dirs, exported = safe_dirs(text, dirs0), set()
     queue, funcs, expansions, i = list(segs), {}, 0, -1
     while i + 1 < len(queue):
         i += 1
@@ -740,7 +694,7 @@ def analyze(cmd, cwd, depth=0, env0=None, sure0=frozenset(), dirs0=SAFE_DIRS):
             del queue[i + 1:end]
             continue
         words, redirects = split_redirects(seg)
-        name, args, assigns = command_of(words, {k: v for k, v in env.items() if k in sure}, dirs)
+        name, args, assigns = command_of(words)
         targets = write_targets(name, args, redirects)
         check_writes(targets, cmd, deny)
         body = next((bodies[int(h.group(1))] for h in map(HEREDOC_TOKEN.fullmatch, words) if h), None)
@@ -758,7 +712,6 @@ def analyze(cmd, cwd, depth=0, env0=None, sure0=frozenset(), dirs0=SAFE_DIRS):
             cur_dir = resolve(cur_dir, args[0])
         elif name == "export":
             env.update(a.split("=", 1) for a in args if "=" in a)
-            exported.update(a.split("=", 1)[0] for a in args if not a.startswith("-"))
         elif name in ("source", "."):
             # a sourced env file that switches this shell to prod makes the commands after it prod
             path = resolve(cur_dir, args[0]) if args else ""
@@ -787,14 +740,9 @@ def analyze(cmd, cwd, depth=0, env0=None, sure0=frozenset(), dirs0=SAFE_DIRS):
             if nested is not None:
                 # a nested shell runs its own command line: check it like this one, with this segment's env. The
                 # outer checks below still apply to it (a deploy script's name and stage, prod-credential writes).
-                # A command word inside it that the guard can't resolve asks (command_of's UNSEEN). A variable that
-                # this segment's own prefix sets is ambiguous once quoting is gone: `CMD=x eval "$CMD"` expands the
-                # outer $CMD, `CMD=x bash -c '$CMD'` the prefix's. Ask rather than guess.
-                if set(re.findall(r"\$\{?([A-Za-z_]\w*)", nested)) & set(assigns):
-                    ask.append(f"`{name}` reads a variable that its own prefix assignment sets")
-                elif depth < 3:
-                    inner_deny, inner_ask = analyze(  # a child shell sees only exported variables; eval runs in this shell
-                        nested, cur_dir, depth + 1, scoped, sure if name == "eval" else sure & exported, dirs)
+                # A command word inside it built from a variable or a substitution asks (command_of's UNSEEN).
+                if depth < 3:
+                    inner_deny, inner_ask = analyze(nested, cur_dir, depth + 1, scoped)
                     deny += inner_deny
                     ask += inner_ask
                 else:

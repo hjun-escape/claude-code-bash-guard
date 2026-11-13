@@ -30,7 +30,7 @@ A bare mention of the account id (in an ARN, a CDK account map, or docs) is data
 
 Heredocs, `$( … )`, backticks and `$(( … ))` (each substitution is checked as its own command), `<( … )` process substitution, line continuations, wrappers (`env`, `sudo`, `timeout`, `xargs`, `npx`, `uvx`…), inline and exported variables, `cd` / `git -C`, and shell functions, whose bodies are checked where they're **called**, with the environment of that moment.
 
-Nested shells (`bash -c`, `bash -lc`, `sh -ec`, a heredoc'd or script-file shell) and `eval` get their command lines checked with the same rules and the environment they inherit, and the outer checks still apply to them. A command whose name it can't see asks, at any depth: `$CMD`, `eval "$CMD"`, `bash -c '"$@"'`, `$(echo git) push`. A variable whose value is certain (assigned once in the same command, unconditionally, on a line with no pipe, `&` or subshell, never bound another way, with `IFS` untouched; a child shell sees only exported ones) is expanded first, and an unquoted one holding a whole command line is split into it as bash does. A nested command line that reads a variable its own prefix assignment sets asks, because which value it sees depends on quoting.
+Nested shells (`bash -c`, `bash -lc`, `sh -ec`, a heredoc'd or script-file shell) and `eval` get their command lines checked with the same rules and the environment they inherit, and the outer checks still apply to them. A command whose name is built from a variable or a substitution asks, at any depth: `$CMD`, `eval "$CMD"`, `bash -c '"$@"'`, `$(echo git) push`, `$X/grep`, even a `$G` set earlier on the same line. The guard doesn't try to work out what a variable holds (see below).
 
 It reads a command line the way bash does: a comment starts only at a word boundary (`# git push` after a space is a comment, the `#` in `x=a#` is not), a backslash-newline is deleted rather than turned into a space, `$'...'` strings honor their backslash escapes and end at a NUL, and each `$( … )` body is read in its own context.
 
@@ -38,13 +38,13 @@ It reads a command line the way bash does: a comment starts only at a word bound
 
 ```bash
 python3 test_bash_guard.py      # 192/192 passed
-python3 mutate_bash_guard.py    # 67 mutants, all KILLED
+python3 mutate_bash_guard.py    # 50 mutants, all KILLED
 ```
 
 - **191 table cases** (allow / ask / deny), plus an end-to-end run of the `bash-guard.sh` fast path. Many are replays of real commands that the guard once got wrong in either direction.
-- **67 mutants.** Each one removes or bends a single rule, for example "AWS non-read ops allowed", "explicit dev profile doesn't win", "function calls not expanded", "nested shells not analyzed", "any mention of the account id = prod". The table tests must fail for every mutant. A mutant that survives means that rule has no test protecting it.
+- **50 mutants.** Each one removes or bends a single rule, for example "AWS non-read ops allowed", "explicit dev profile doesn't win", "function calls not expanded", "nested shells not analyzed", "any mention of the account id = prod". The table tests must fail for every mutant. A mutant that survives means that rule has no test protecting it.
 
-Seven rounds of security review found ways around earlier versions: commands nested in `bash -c`, `bash -lc` or `eval`; a mid-word `#`, a backslash-newline or a `$'...'` string that made the parser see a comment where bash sees code; a command hidden in a variable or a substitution's output; `AWS_DEFAULT_PROFILE`; an uppercase `--stage PROD`; and unparseable commands that were allowed. The second round also caught a regression from the first: a nested shell skipped the outer deploy-script check. Each fix started as a failing test and has its own mutant.
+Eight rounds of security review found ways around earlier versions: commands nested in `bash -c`, `bash -lc` or `eval`; a mid-word `#`, a backslash-newline or a `$'...'` string that made the parser see a comment where bash sees code; a command hidden in a variable or a substitution's output; `AWS_DEFAULT_PROFILE`; an uppercase `--stage PROD`; and unparseable commands that were allowed. The second round also caught a regression from the first: a nested shell skipped the outer deploy-script check. Rounds four to eight all went after code that worked out what a variable in command position held (conditional and repeated assignments, `IFS`, `printf -v`, subshells, a re-bound `$HOME`), so that code was removed and such commands now ask. Each fix started as a failing test and has its own mutant.
 
 The tests build a throwaway workspace (two git repos, `acme/api` and `acme/web_app`, plus fixture scripts) and run with `BASH_GUARD_OFFLINE=1`, so they never call GitHub.
 
