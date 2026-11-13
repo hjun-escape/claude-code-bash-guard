@@ -21,8 +21,9 @@ or, with nothing selected, when the code it runs picks the prod profile itself. 
 bash…) whose code is visible (-c/-e, heredoc, a script written earlier in the command, the script file on disk),
 only code that touches AWS with a WRITE call is gated; prod-read code passes. Invisible code under prod
 credentials still asks. A bare mention of the account id (an ARN, a CDK account map, docs) is data, not use.
-Nested shells (`bash -c`, `sh -c`, a heredoc'd or script-file shell) and `eval` are re-checked as command
-lines with the same rules, and `#` starts a comment only where bash says it does.
+Nested shells (`bash -c`, `bash -lc`, a heredoc'd or script-file shell) and `eval` are re-checked as command
+lines with the same rules, and one it can't see asks. Comments, backslash-newlines and `$'...'` strings are read
+the way bash reads them, and a command that can't be parsed asks.
 Lessons that shaped it: matching on any mention of the account id prompted on `mkdir` and CDK edits; scanning
 on-disk scripts that merely SUPPORT prod flagged `ruff`, `cmp` and `--stage dev` runs; continuation lines and
 `<(…)` were mis-parsed. A hook "ask" prompts even in auto mode and even when an allow rule like Bash(gh *)
@@ -42,8 +43,6 @@ PROD_CREDENTIAL = re.compile(
 HEREDOC_TOKEN = re.compile(r"__HEREDOC_(\d+)__")
 INTERPRETER = re.compile(r"^(python[\d.]*|node|bash|sh|zsh|ruby|perl|deno|bun|tsx|ts-node)$")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}  # their -c string / heredoc / script is re-checked as a command line
-# gated commands, for a command line that shlex cannot parse (it fails closed when one of these appears)
-GATED_HINT = re.compile(r"\b(?:git\s+push|git\s+commit\b.*--no-verify|gh\s+(?:release|pr\s+merge|workflow\s+run|run\s+rerun|api)|(?:sls|serverless|cdk)\s+(?:deploy|remove|rollback|invoke|destroy))\b")
 # Code that CHANGES state (boto3 snake_case verbs, SDK v3 *Command classes, DocumentClient v2,
 # CLI write ops, HTTP writes). add_/import_/set_ are left out on purpose: argparse add_argument, importlib
 # import_module etc. are everywhere and never write to AWS.
@@ -200,13 +199,71 @@ def strip_comments(s):
     return "".join(out)
 
 
+ANSI_C_ESCAPE = re.compile(r"\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3})|c(.)|(.))", re.S)
+ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+                 "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _ansi_c_char(m):
+    hx, u, big_u, octal, ctrl, other = m.groups()
+    if hx or u or big_u:
+        cp = int(hx or u or big_u, 16)
+        return chr(cp) if 0 < cp <= 0x10FFFF else ""  # bash ends the string at NUL; drop it rather than carry it
+    if octal:
+        return chr(int(octal, 8) & 0xFF) if int(octal, 8) & 0xFF else ""
+    if ctrl is not None:
+        return chr(ord(ctrl) & 0x1F)
+    return ANSI_C_SIMPLE.get(other, "\\" + other)
+
+
+def expand_ansi_c(s):
+    """Rewrite each $'...' string (bash's ANSI-C quoting) as a plain single-quoted one. Inside $'...' a backslash
+    escapes the next character, so \\' does not end the string. shlex and strip_comments don't know the form, and
+    would read `$'\\' #'; git push` as ending in a comment, though bash runs the push."""
+    out, i, n, quote = [], 0, len(s), None
+    while i < n:
+        c = s[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(s[i + 1])
+                i += 2
+                continue
+            quote = None if c == quote else quote
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        if c == "$" and s.startswith("'", i + 1):
+            j = i + 2
+            while j < n and s[j] != "'":
+                j += 2 if s[j] == "\\" else 1
+            if j >= n:  # unterminated: leave it for shlex to reject, so the guard fails closed
+                out.append(s[i:])
+                break
+            out.append(shlex.quote(ANSI_C_ESCAPE.sub(_ansi_c_char, s[i + 2:j])))
+            i = j + 1
+            continue
+        if c in "'\"":
+            quote = c
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def normalize(cmd):
+    """What bash does to a command line before it splits words: a backslash-newline is deleted (not turned into a
+    space, so `a\\<newline>#b` is one word), $'...' strings are read, and comments are dropped."""
+    return strip_comments(expand_ansi_c(cmd.replace("\\\n", "")))
+
+
 def is_op(tok):
     return tok != "" and all(c in ";&|()<>\n" for c in tok)
 
 
 def segments(cmd):
-    cmd = cmd.replace("\\\n", " ")  # backslash-newline is a line continuation, not a command separator
-    cmd = strip_comments(cmd)
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
@@ -553,12 +610,42 @@ def prod_selection(scoped, args):
     return None
 
 
-def visible_code(args, bodies, cur_dir, written):
+def code_index(args, shell):
+    """Where a `-c`-style invocation keeps its code, or None. A shell takes it from the first operand after its
+    options when any option cluster contains c (`bash -lc 'cmd'`, `sh -ec 'cmd'`, `bash -o pipefail -c 'cmd'`);
+    other interpreters from the word after -c / -e / --eval or a cluster ending in c or e (`python3 -Bc`, `perl -ne`)."""
+    if shell:
+        has_c, i = False, 0
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                i += 1
+                break
+            if re.fullmatch(r"[-+][A-Za-z]+", a):
+                has_c = has_c or (a[0] == "-" and "c" in a)
+                i += 2 if a[-1] in "oO" else 1  # -o / -O take an option name
+            elif a in ("--rcfile", "--init-file"):
+                i += 2
+            elif a.startswith("--"):
+                i += 1
+            else:
+                break
+        return i if has_c and i < len(args) else None
+    return next((i + 1 for i, a in enumerate(args[:-1])
+                 if a in ("-c", "-e", "--eval") or re.fullmatch(r"-[A-Za-z]*[ce]", a)), None)
+
+
+def expand_vars(text, env):
+    """Substitute $VAR / ${VAR} that this command line set itself; references it can't resolve stay as written."""
+    return re.sub(r"\$(?:\{(\w+)\}|([A-Za-z_]\w*))", lambda m: env.get(m.group(1) or m.group(2), m.group(0)), text)
+
+
+def visible_code(args, bodies, cur_dir, written, shell=False):
     """The code an interpreter segment will run, when the command shows it: a -c/-e string, a heredoc body, a
     script written earlier in this command, or the script file on disk. None when it can't be seen."""
-    for flag in ("-c", "-e", "--eval"):
-        if flag in args and args.index(flag) + 1 < len(args):
-            return args[args.index(flag) + 1]
+    idx = code_index(args, shell)
+    if idx is not None:
+        return args[idx]
     for a in args:
         h = HEREDOC_TOKEN.fullmatch(a)
         if h:
@@ -588,12 +675,11 @@ def analyze(cmd, cwd, depth=0, env0=None):
                     "in stacks-map.js.")
     try:
         text, bodies = strip_heredocs(cmd)
-        text = strip_comments(text)
+        text = normalize(text)
         text, subs = extract_substitutions(text)
         segs = segments(text) + [s for sub in subs for s in segments(sub)]
     except ValueError:
-        if PROD_CREDENTIAL.search(cmd) or GATED_HINT.search(cmd):
-            ask.append("command could not be parsed, and it selects PROD credentials or runs a gated command")
+        ask.append("command could not be parsed, so the guard can't check it")
         return deny, ask
     cur_dir, env, written = cwd, dict(env0 or {}), {}
     queue, funcs, expansions, i = list(segs), {}, 0, -1
@@ -643,17 +729,21 @@ def analyze(cmd, cwd, depth=0, env0=None):
                 expansions += 1
                 queue[i + 1:i + 1] = [list(s) for s in funcs[name]]
             continue
-        elif name == "eval" or (name in SHELLS and visible_code(args, bodies, cur_dir, written) is not None):
-            # a nested shell runs its own command line: check it like the outer one, with this segment's env
-            inner = " ".join(args) if name == "eval" else visible_code(args, bodies, cur_dir, written)
-            if depth < 3:
-                inner_deny, inner_ask = analyze(inner, cur_dir, depth + 1, scoped)
-                deny += inner_deny
-                ask += inner_ask
-            else:
-                ask.append(f"`{name}` nests shells too deeply to check")
-            continue
         else:
+            nested = " ".join(args) if name == "eval" else (
+                visible_code(args, bodies, cur_dir, written, shell=True) if name in SHELLS else None)
+            if nested is not None:
+                # a nested shell runs its own command line: check it like this one, with this segment's env. The
+                # outer checks below still apply to it (a deploy script's name and stage, prod-credential writes).
+                nested = expand_vars(nested, scoped)
+                if re.match(r"\s*[\"']?\$", nested):  # `eval "$CMD"`, `bash -c '"$@"' _ git push`: unseen command
+                    ask.append(f"`{name}` runs a command line the guard can't see")
+                elif depth < 3:
+                    inner_deny, inner_ask = analyze(nested, cur_dir, depth + 1, scoped)
+                    deny += inner_deny
+                    ask += inner_ask
+                else:
+                    ask.append(f"`{name}` nests shells too deeply to check")
             code_arg = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-c", "-e", "--eval")), None)
             script = name if "deploy" in name else next(  # inline code and prose aren't script names
                 (a.rsplit("/", 1)[-1] for a in args if "deploy" in a and not a.startswith("-")
@@ -663,7 +753,8 @@ def analyze(cmd, cwd, depth=0, env0=None):
                 continue
             if sel == "nonprod" or is_dry_run_script(name, args, cur_dir):
                 continue
-            code = visible_code(args, bodies, cur_dir, written) if INTERPRETER.match(name) else None
+            code = nested if nested is not None else (
+                visible_code(args, bodies, cur_dir, written, name in SHELLS) if INTERPRETER.match(name) else None)
             if sel != "prod" and not (code and PROD_CREDENTIAL.search(code)):
                 continue
             if code is None:

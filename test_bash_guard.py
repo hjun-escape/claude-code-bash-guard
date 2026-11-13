@@ -43,6 +43,8 @@ FIXTURES = {
     # selects the prod profile itself and WRITES
     "prod-writer.py": f"import boto3\nddb = boto3.Session(profile_name='{P}').client('dynamodb')\n"
                       "ddb.delete_item(TableName='T', Key={})\n",
+    # a deploy script that takes its stage from the first argument
+    "deploy.sh": 'npx serverless deploy --stage "$1"\n',
 }
 for name, body in FIXTURES.items():
     with open(f"{TMP}/scripts/{name}", "w") as fh:
@@ -81,7 +83,7 @@ CASES = [
     ("echo 'force: true' > /tmp/x.txt", MAIN, "allow"),
     ("cat > /tmp/notes.md <<'EOF'\nIt's a push to prod with --force\nEOF", MAIN, "allow"),
     ("cat > /tmp/notes.md <<'EOF'\ngit push --force origin x\nEOF", API, "allow"),
-    ('echo "unbalanced', MAIN, "allow"),
+    ('echo "unbalanced', MAIN, "ask"),  # unparseable: ask (bash rejects it too; the wrapper only sends trigger-word commands)
     # the account id as DATA is not credential use — real prompts from 2026-09-29, replayed
     ("mkdir -p /tmp/g && cat > /tmp/g/mut.py <<'PY'\nROLE = \"arn:aws:iam::111111111111:role/ci-deploy\"\nPY\ncd /tmp/g && python mut.py --ref c5", MAIN, "allow"),
     ("cd infra && python3 - <<'PY'\nACCOUNTS = {\"dev\": \"222222222222\", \"prod\": \"111111111111\"}\nopen('app.py', 'w').write(repr(ACCOUNTS))\nPY", MAIN, "allow"),
@@ -198,6 +200,23 @@ CASES = [
     ("echo ok # `git push --force origin x`", MAIN, "allow"),  # a substitution inside a comment never runs
     ("echo hi # note\ngit push --force origin x", API, "ask"),  # a comment ends at the newline
     ("eval eval eval eval git push origin feat/x", API, "ask"),  # nesting past 3 levels asks instead of recursing
+    # --- security review of the fix (2026-11-12): outer checks kept, backslash-newline, $'...' strings ---
+    ("bash scripts/deploy.sh prod", TMP, "ask"),  # a nested shell still gets the outer deploy-script check
+    (f'export AWS_PROFILE={P}; eval "$CMD"', MAIN, "ask"),  # ...and eval under prod still asks when its code can't be seen
+    (f"x=a\\\n#; aws dynamodb delete-item --table-name T --key k --profile {P}", MAIN, "ask"),  # bash deletes backslash-newline: this # is mid-word
+    ("echo $'\\' #'; git push --force origin x", API, "ask"),  # in $'...' a backslash escapes the quote
+    ("$'\\x67it' push --force origin x", API, "ask"),  # $'\\x67it' is git
+    ("git commit -m $'first line\\n\\nsecond line'", API, "allow"),
+    ('bash -lc "git push --force origin feat/x"', API, "ask"),  # option clusters: -lc, -ec, -o pipefail -c
+    ("sh -ec 'gh release create v1'", API, "ask"),
+    ('bash -o pipefail -c "git push --force origin feat/x"', API, "ask"),
+    ('bash -lc "npm test"', API, "allow"),
+    ("bash -c '\"$@\"' _ git push --force origin x", API, "ask"),  # the command is in arguments the guard can't see
+    ('CMD="git status"; eval "$CMD"', API, "allow"),  # variables set in the same command are expanded
+    ('CMD="git push --force origin x"; eval "$CMD"', API, "ask"),
+    (f"export AWS_PROFILE={P}; bash -c 'node scripts/writes-by-default.js'", TMP, "ask"),  # the nested shell inherits the profile
+    (f"export AWS_PROFILE={P}; eval 'aws dynamodb scan --table-name T'", MAIN, "allow"),  # eval's text is its visible code, as with bash -c
+    (f"export AWS_PROFILE={P}; bash -e scripts/missing.sh", TMP, "ask"),  # -e is an option, not code: the script is unseen
     ('bash -c "echo SECRET=1 > web_app/.env.local"', MAIN, "deny"),
     # --- deny: Bash writes that would bypass the Edit/Write guards ---
     ("echo SECRET=1 >> web_app/.env.secret", MAIN, "deny"),
