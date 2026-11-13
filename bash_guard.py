@@ -43,6 +43,10 @@ PROD_CREDENTIAL = re.compile(
 HEREDOC_TOKEN = re.compile(r"__HEREDOC_(\d+)__")
 INTERPRETER = re.compile(r"^(python[\d.]*|node|bash|sh|zsh|ruby|perl|deno|bun|tsx|ts-node)$")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}  # their -c string / heredoc / script is re-checked as a command line
+# a nested command line whose command the guard can't see: `$CMD`, `"$@"`, or a substitution's output, in command
+# position (the start, after ; & | ( { or a newline, after then/do/else, past assignments and exec/env/sudo)
+UNSEEN_COMMAND = re.compile(r"(?:^|[;&|({\n]|\b(?:then|do|else|elif)\s)\s*(?:\w+=\S*\s+)*"
+                            r"(?:(?:exec|command|nohup|env|time|sudo)\s+)*[\"']?(?:\$|__SUBST__)")
 # Code that CHANGES state (boto3 snake_case verbs, SDK v3 *Command classes, DocumentClient v2,
 # CLI write ops, HTTP writes). add_/import_/set_ are left out on purpose: argparse add_argument, importlib
 # import_module etc. are everywhere and never write to AWS.
@@ -208,9 +212,9 @@ def _ansi_c_char(m):
     hx, u, big_u, octal, ctrl, other = m.groups()
     if hx or u or big_u:
         cp = int(hx or u or big_u, 16)
-        return chr(cp) if 0 < cp <= 0x10FFFF else ""  # bash ends the string at NUL; drop it rather than carry it
+        return chr(cp) if cp <= 0x10FFFF else ""
     if octal:
-        return chr(int(octal, 8) & 0xFF) if int(octal, 8) & 0xFF else ""
+        return chr(int(octal, 8) & 0xFF)
     if ctrl is not None:
         return chr(ord(ctrl) & 0x1F)
     return ANSI_C_SIMPLE.get(other, "\\" + other)
@@ -243,7 +247,8 @@ def expand_ansi_c(s):
             if j >= n:  # unterminated: leave it for shlex to reject, so the guard fails closed
                 out.append(s[i:])
                 break
-            out.append(shlex.quote(ANSI_C_ESCAPE.sub(_ansi_c_char, s[i + 2:j])))
+            text = ANSI_C_ESCAPE.sub(_ansi_c_char, s[i + 2:j]).split("\x00", 1)[0]  # bash ends the string at NUL
+            out.append(shlex.quote(text))
             i = j + 1
             continue
         if c in "'\"":
@@ -677,7 +682,7 @@ def analyze(cmd, cwd, depth=0, env0=None):
         text, bodies = strip_heredocs(cmd)
         text = normalize(text)
         text, subs = extract_substitutions(text)
-        segs = segments(text) + [s for sub in subs for s in segments(sub)]
+        segs = segments(text) + [s for sub in subs for s in segments(normalize(sub))]  # each body in its own context
     except ValueError:
         ask.append("command could not be parsed, so the guard can't check it")
         return deny, ask
@@ -735,8 +740,10 @@ def analyze(cmd, cwd, depth=0, env0=None):
             if nested is not None:
                 # a nested shell runs its own command line: check it like this one, with this segment's env. The
                 # outer checks below still apply to it (a deploy script's name and stage, prod-credential writes).
-                nested = expand_vars(nested, scoped)
-                if re.match(r"\s*[\"']?\$", nested):  # `eval "$CMD"`, `bash -c '"$@"' _ git push`: unseen command
+                # expand only what earlier segments set: a prefix assignment (`CMD=x eval "$CMD"`) comes too late
+                # for the outer shell's own expansion of the arguments
+                nested = expand_vars(nested, env)
+                if UNSEEN_COMMAND.search(nested):  # `eval "$CMD"`, `bash -c '"$@"' _ git push`, `eval "$(curl …)"`
                     ask.append(f"`{name}` runs a command line the guard can't see")
                 elif depth < 3:
                     inner_deny, inner_ask = analyze(nested, cur_dir, depth + 1, scoped)
