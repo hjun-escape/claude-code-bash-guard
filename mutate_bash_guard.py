@@ -52,15 +52,15 @@ mutants = {
     "parse errors fail open": ('        ask.append("command could not be parsed, so the guard can\'t check it")\n', "        pass\n"),
     "shell option clusters ignored": ('has_c = has_c or (a[0] == "-" and "c" in a)', 'has_c = has_c or a == "-c"'),
     "-o argument read as the code": ('i += 2 if a[-1] in "oO" else 1', "i += 1"),
-    "unseen nested command allowed": ("if UNSEEN_COMMAND.search(nested):", "if False:"),
-    "unseen command only at the start": ("UNSEEN_COMMAND.search(nested)", "UNSEEN_COMMAND.match(nested)"),
-    "substitution output seen as a command": (r"(?:\$|__SUBST__)", r"(?:\$)"),
-    "nested vars not expanded": ("                nested = expand_vars(nested, env)\n", ""),
-    "prefix assignments expanded": ("expand_vars(nested, env)", "expand_vars(nested, scoped)"),
     "$'...' strings not read": ("def expand_ansi_c(s):\n", "def expand_ansi_c(s):\n    return s\n"),
     "$'...' escapes not decoded": ("ANSI_C_ESCAPE.sub(_ansi_c_char, s[i + 2:j])", "s[i + 2:j]"),
     "$'...' kept past NUL": (r'.split("\x00", 1)[0]', ""),
     "substitution bodies not normalized": ("segments(normalize(sub))", "segments(sub)"),
+    "unseen command names allowed": ("        if name == UNSEEN:\n", "        if False:\n"),
+    "substitution output seen as a command": ('if "$" in name or "__SUBST__" in name:', 'if "$" in name:'),
+    "command words not expanded": ("    word = expand_vars(words[i], env) if env else words[i]\n", "    word = words[i]\n"),
+    "expanded command line not word-split": (r'    if word != words[i] and re.search(r"\s", word):', "    if False:"),
+    "prefix-assigned variable read": (r'if set(re.findall(r"\$\{?([A-Za-z_]\w*)", nested)) & set(assigns):', "if False:"),
 }
 scratch = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="bash-guard-mutants-"))
 survivors = 0

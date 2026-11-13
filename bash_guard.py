@@ -43,10 +43,7 @@ PROD_CREDENTIAL = re.compile(
 HEREDOC_TOKEN = re.compile(r"__HEREDOC_(\d+)__")
 INTERPRETER = re.compile(r"^(python[\d.]*|node|bash|sh|zsh|ruby|perl|deno|bun|tsx|ts-node)$")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}  # their -c string / heredoc / script is re-checked as a command line
-# a nested command line whose command the guard can't see: `$CMD`, `"$@"`, or a substitution's output, in command
-# position (the start, after ; & | ( { or a newline, after then/do/else, past assignments and exec/env/sudo)
-UNSEEN_COMMAND = re.compile(r"(?:^|[;&|({\n]|\b(?:then|do|else|elif)\s)\s*(?:\w+=\S*\s+)*"
-                            r"(?:(?:exec|command|nohup|env|time|sudo)\s+)*[\"']?(?:\$|__SUBST__)")
+UNSEEN = "$unseen"  # command_of's name for a command word the guard can't resolve: `$CMD`, `"$@"`, `$(…)` output
 # Code that CHANGES state (boto3 snake_case verbs, SDK v3 *Command classes, DocumentClient v2,
 # CLI write ops, HTTP writes). add_/import_/set_ are left out on purpose: argparse add_argument, importlib
 # import_module etc. are everywhere and never write to AWS.
@@ -327,8 +324,11 @@ def split_redirects(seg):
     return words, targets
 
 
-def command_of(words):
-    """Return (command name, args, inline assignments); name is None for keyword-only segments."""
+def command_of(words, env=None):
+    """Return (command name, args, inline assignments); name is None for keyword-only segments and UNSEEN for a
+    command word made of a variable or a substitution that this command line didn't set (`$CMD`, `$(echo git)`).
+    A variable set by an earlier segment (env) is expanded, and an unquoted one holding a whole command line is
+    word-split into it, as bash does."""
     assigns, i = {}, 0
     while i < len(words):
         t = words[i]
@@ -356,7 +356,12 @@ def command_of(words):
         break
     if i >= len(words):
         return None, [], assigns
-    name = words[i].rsplit("/", 1)[-1]
+    word = expand_vars(words[i], env) if env else words[i]
+    if word != words[i] and re.search(r"\s", word):  # `CMD="git push --force"; $CMD`
+        return command_of(words[:i] + word.split() + words[i + 1:])
+    name = word.rsplit("/", 1)[-1]
+    if "$" in name or "__SUBST__" in name:
+        return UNSEEN, words[i + 1:], assigns
     if not re.fullmatch(r"[A-Za-z0-9_.][\w.+-]*", name) or not re.search(r"[A-Za-z]", name):
         return None, [], assigns  # `$G`, `-`, `*`, `000`, `--end-time`: debris, not a command
     return name, words[i + 1:], assigns
@@ -697,12 +702,15 @@ def analyze(cmd, cwd, depth=0, env0=None):
             del queue[i + 1:end]
             continue
         words, redirects = split_redirects(seg)
-        name, args, assigns = command_of(words)
+        name, args, assigns = command_of(words, env)
         targets = write_targets(name, args, redirects)
         check_writes(targets, cmd, deny)
         body = next((bodies[int(h.group(1))] for h in map(HEREDOC_TOKEN.fullmatch, words) if h), None)
         if body is not None:  # remember what this segment writes to files, in case a later segment runs it
             written.update((resolve(cur_dir, t), body) for t in targets)
+        if name == UNSEEN:
+            ask.append("runs a command the guard can't see: its name is a variable or a substitution's output")
+            continue
         if name is None:
             env.update(assigns)  # bare `VAR=x;` — conservatively treat it as reaching the commands that follow
             continue
@@ -740,11 +748,11 @@ def analyze(cmd, cwd, depth=0, env0=None):
             if nested is not None:
                 # a nested shell runs its own command line: check it like this one, with this segment's env. The
                 # outer checks below still apply to it (a deploy script's name and stage, prod-credential writes).
-                # expand only what earlier segments set: a prefix assignment (`CMD=x eval "$CMD"`) comes too late
-                # for the outer shell's own expansion of the arguments
-                nested = expand_vars(nested, env)
-                if UNSEEN_COMMAND.search(nested):  # `eval "$CMD"`, `bash -c '"$@"' _ git push`, `eval "$(curl …)"`
-                    ask.append(f"`{name}` runs a command line the guard can't see")
+                # A command word inside it that the guard can't resolve asks (command_of's UNSEEN). A variable that
+                # this segment's own prefix sets is ambiguous once quoting is gone: `CMD=x eval "$CMD"` expands the
+                # outer $CMD, `CMD=x bash -c '$CMD'` the prefix's. Ask rather than guess.
+                if set(re.findall(r"\$\{?([A-Za-z_]\w*)", nested)) & set(assigns):
+                    ask.append(f"`{name}` reads a variable that its own prefix assignment sets")
                 elif depth < 3:
                     inner_deny, inner_ask = analyze(nested, cur_dir, depth + 1, scoped)
                     deny += inner_deny
